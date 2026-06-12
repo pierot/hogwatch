@@ -17,7 +17,13 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 
 ### From Releases
 
-Grab the zip from the [latest release](https://github.com/pierot/hogwatch/releases/latest) and unzip it. The binary is universal (Apple Silicon + Intel) but ad-hoc signed, not notarized, so the first launch needs right-click > Open, or clear the quarantine flag: `xattr -dr com.apple.quarantine Hogwatch.app`.
+Grab the zip from the [latest release](https://github.com/pierot/hogwatch/releases/latest) and unzip it. The binary is universal (Apple Silicon + Intel) but ad-hoc signed, not notarized, so macOS quarantines the download and refuses to open it. Clear the flag before first launch:
+
+```sh
+xattr -dr com.apple.quarantine Hogwatch.app
+```
+
+Alternatively, open the app once to dismiss the warning, then allow it under System Settings > Privacy & Security > Open Anyway. (Right-click > Open no longer bypasses Gatekeeper since macOS 15.)
 
 ### From source
 

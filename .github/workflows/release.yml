@@ -37,7 +37,7 @@ jobs:
             --generate-notes \
             --notes "Universal binary (Apple Silicon + Intel), macOS 13+.
 
-          The app is ad-hoc signed, not notarized: after unzipping, right-click the app and choose Open the first time (or run \`xattr -d com.apple.quarantine Hogwatch.app\`)."
+          The app is ad-hoc signed, not notarized, so macOS quarantines the download. After unzipping, run \`xattr -dr com.apple.quarantine Hogwatch.app\`, or open the app once and allow it under System Settings > Privacy & Security > Open Anyway."
 
       - name: Upload artifact (non-tag run)
         if: github.ref_type != 'tag'
