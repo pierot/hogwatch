@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal app
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          HOGWATCH_VERSION="$VERSION" ./build.sh
+          lipo -archs Hogwatch.app/Contents/MacOS/Hogwatch
+
+      - name: Package
+        run: ditto -c -k --keepParent Hogwatch.app "Hogwatch-${VERSION}.zip"
+
+      - name: Create release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "Hogwatch-${VERSION}.zip" \
+            --generate-notes \
+            --notes "Universal binary (Apple Silicon + Intel), macOS 13+.
+
+          The app is ad-hoc signed, not notarized: after unzipping, right-click the app and choose Open the first time (or run \`xattr -d com.apple.quarantine Hogwatch.app\`)."
+
+      - name: Upload artifact (non-tag run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hogwatch-${{ env.VERSION }}
+          path: Hogwatch-${{ env.VERSION }}.zip

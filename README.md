@@ -15,6 +15,12 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 
 ## Install
 
+### From Releases
+
+Grab the zip from the [latest release](https://github.com/pierot/hogwatch/releases/latest) and unzip it. The binary is universal (Apple Silicon + Intel) but ad-hoc signed, not notarized, so the first launch needs right-click > Open, or clear the quarantine flag: `xattr -dr com.apple.quarantine Hogwatch.app`.
+
+### From source
+
 ```sh
 ./build.sh
 open Hogwatch.app
