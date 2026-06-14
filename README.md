@@ -4,6 +4,10 @@ A macOS menu bar watchdog for CPU hogs. It samples running processes, shows the 
 
 Single Swift file, no dependencies, builds in seconds with the Xcode Command Line Tools.
 
+<p align="center">
+  <img src="docs/menu.png" alt="Hogwatch dropdown ranking the top processes by average CPU" width="443">
+</p>
+
 ## What it does
 
 - Samples `ps` every 30 seconds and keeps a sliding window (default 15 minutes).
@@ -12,6 +16,10 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 - When a process stays above a threshold (default 90% of one core) for a sustained period (default 30 minutes), you get a notification with Kill, Force Kill, and Mute buttons.
 - The menu bar icon turns orange as soon as anything crosses the icon threshold, before the notification fires. Hover it to see the culprit.
 - Processes you never want alerts for (backup tools, indexers) can be muted by name.
+
+<p align="center">
+  <img src="docs/notification.png" alt="Hogwatch alert for a process sustaining high CPU" width="352">
+</p>
 
 ## Install
 
