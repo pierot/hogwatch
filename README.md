@@ -17,6 +17,7 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 - When a process stays above a threshold (default 90% of one core) for a sustained period (default 30 minutes), you get a notification with Kill, Force Kill, and Mute buttons.
 - The menu bar icon turns orange as soon as anything crosses the icon threshold, before the notification fires. Hover it to see the culprit.
 - Processes you never want alerts for (backup tools, indexers) can be muted by name.
+- Once a day, Hogwatch asks the GitHub API for the latest release. When a newer version exists, you get one notification per version and an "Update available" item in the dropdown. The request is a plain GET to `api.github.com/repos/pierot/hogwatch/releases/latest` and sends no data about your processes.
 
 <p align="center">
   <img src="docs/notification.png" alt="Hogwatch alert for a process sustaining high CPU" width="352">
@@ -58,6 +59,7 @@ Everything lives under the Settings item in the dropdown and persists in UserDef
 | Alert after | 30 min | How long a process must stay above the threshold |
 | Orange above | 90% | Icon early-warning threshold, independent of the alert; can be off |
 | Muted alerts | none | Per-name mute list, fed by the notification's Mute button |
+| Check for updates | on | Daily check for a new GitHub release |
 
 ## Semantics
 

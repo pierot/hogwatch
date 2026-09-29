@@ -5,7 +5,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="Hogwatch.app"
-VERSION="${HOGWATCH_VERSION:-1.0}"
+# Default to the latest tag, so a local build does not report its own
+# release as an update.
+TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+VERSION="${HOGWATCH_VERSION:-${TAG#v}}"
+VERSION="${VERSION:-1.0}"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 

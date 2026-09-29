@@ -8,6 +8,9 @@ let fastTickInterval: TimeInterval = 1       // sampling interval while the drop
 let renotifyCooldown: TimeInterval = 60 * 60 // min interval between alerts for the same pid
 let coolResetSamples = 3                     // consecutive below-threshold samples before sustained tracking resets
 let topCount = 10
+let updateCheckInterval: TimeInterval = 24 * 60 * 60 // between successful update checks
+let updateRetryInterval: TimeInterval = 60 * 60      // after a failed one, e.g. no network at login
+let latestReleaseURL = URL(string: "https://api.github.com/repos/pierot/hogwatch/releases/latest")!
 
 // MARK: - Settings
 
@@ -54,12 +57,25 @@ enum Settings {
         mutedNames.removeAll { $0 == name }
     }
 
+    static var checkForUpdates: Bool {
+        get { UserDefaults.standard.bool(forKey: "checkForUpdates") }
+        set { UserDefaults.standard.set(newValue, forKey: "checkForUpdates") }
+    }
+
+    // Tag of the last release a notification went out for, so a restart
+    // doesn't announce the same release again.
+    static var notifiedUpdate: String? {
+        get { UserDefaults.standard.string(forKey: "notifiedUpdate") }
+        set { UserDefaults.standard.set(newValue, forKey: "notifiedUpdate") }
+    }
+
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             "alertThreshold": 90.0,
             "alertMinutes": 30.0,
             "windowMinutes": 15.0,
             "iconThreshold": 90.0,
+            "checkForUpdates": true,
         ])
     }
 }
@@ -77,6 +93,21 @@ struct ProcInfo {
 struct Sample {
     let date: Date
     let cpu: [Int32: Double]
+}
+
+// MARK: - Updates
+
+// The fields used from GitHub's releases/latest response (snake_case keys).
+struct Release: Decodable {
+    let tagName: String // "v1.1"
+    let htmlUrl: URL
+
+    var version: String { tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName }
+
+    // .numeric compares "1.10" above "1.9".
+    func isNewer(than installed: String) -> Bool {
+        version.compare(installed, options: .numeric) == .orderedDescending
+    }
 }
 
 // MARK: - Graph
@@ -207,6 +238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var timer: Timer?
     private var fastTimer: Timer?
     private var notificationsDenied = false
+    private var availableUpdate: Release?
+    private var nextUpdateCheck = Date.distantPast
 
     // MARK: Launch
 
@@ -234,6 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func tick() {
         refreshNotificationStatus()
+        checkForUpdateIfDue()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             // Stamp the sample when ps runs: the main-queue block below waits
             // while the dropdown is open, and a late stamp would look like a
@@ -379,6 +413,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    // MARK: Updates
+
+    // Runs from tick(), so no extra timer: once at launch, then daily.
+    private func checkForUpdateIfDue() {
+        let now = Date()
+        guard Settings.checkForUpdates, now >= nextUpdateCheck else { return }
+        // Move the next check out before the request, so ticks during the
+        // request don't start another; a success moves it out further.
+        nextUpdateCheck = now.addingTimeInterval(updateRetryInterval)
+        var request = URLRequest(url: latestReleaseURL)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            // Errors, rate limits and "no releases" all fail to decode.
+            guard let data, let release = try? decoder.decode(Release.self, from: data) else { return }
+            DispatchQueue.main.async {
+                guard let self, Settings.checkForUpdates else { return }
+                self.nextUpdateCheck = Date().addingTimeInterval(updateCheckInterval)
+                self.apply(release)
+            }
+        }.resume()
+    }
+
+    private func apply(_ release: Release) {
+        let installed = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        guard release.isNewer(than: installed) else {
+            availableUpdate = nil
+            return
+        }
+        availableUpdate = release
+        if Settings.notifiedUpdate != release.tagName {
+            Settings.notifiedUpdate = release.tagName
+            notifyUpdate(release, installed: installed)
+        }
+    }
+
+    private func notifyUpdate(_ release: Release, installed: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Hogwatch \(release.version) is available"
+        content.body = "You have \(installed). Download the new version from GitHub."
+        content.categoryIdentifier = Note.updateCategory
+        content.userInfo = ["url": release.htmlUrl.absoluteString]
+        let req = UNNotificationRequest(
+            identifier: "hogwatch-update-\(release.tagName)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    @objc private func openUpdate(_ sender: NSMenuItem) {
+        guard let url = availableUpdate?.htmlUrl else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func toggleUpdateCheck(_ sender: NSMenuItem) {
+        Settings.checkForUpdates.toggle()
+        if Settings.checkForUpdates {
+            nextUpdateCheck = .distantPast // check on the next tick
+        } else {
+            availableUpdate = nil
+        }
+    }
+
     // MARK: Notification actions
 
     private enum Note {
@@ -386,6 +485,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         static let kill = "KILL"
         static let forceKill = "FORCE_KILL"
         static let mute = "MUTE"
+        static let updateCategory = "UPDATE"
+        static let download = "DOWNLOAD"
     }
 
     private func configureNotifications() {
@@ -402,6 +503,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     UNNotificationAction(identifier: Note.forceKill, title: "Force Kill", options: [.destructive]),
                     UNNotificationAction(identifier: Note.mute, title: "Mute this process", options: []),
                 ],
+                intentIdentifiers: [],
+                options: []
+            ),
+            UNNotificationCategory(
+                identifier: Note.updateCategory,
+                actions: [UNNotificationAction(identifier: Note.download, title: "Download", options: [])],
                 intentIdentifiers: [],
                 options: []
             ),
@@ -435,6 +542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let info = response.notification.request.content.userInfo
         let pid = Int32(info["pid"] as? Int ?? -1)
         let name = info["name"] as? String ?? ""
+        let url = (info["url"] as? String).flatMap { URL(string: $0) }
         let action = response.actionIdentifier
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -446,6 +554,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     Settings.mute(name)
                     self.updateStatusIcon()
                 }
+            // Only update notifications carry a url; a click on the body
+            // opens the release page like the Download button.
+            case Note.download, UNNotificationDefaultActionIdentifier:
+                if let url { NSWorkspace.shared.open(url) }
             default: break
             }
         }
@@ -744,6 +856,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             menu.addItem(off)
         }
 
+        if let update = availableUpdate {
+            let item = NSMenuItem(
+                title: "Update available: \(update.version)…",
+                action: #selector(openUpdate(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.isEnabled = true
+            menu.addItem(item)
+        }
+
         let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         settings.isEnabled = true
         let sub = NSMenu()
@@ -777,6 +900,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             action: #selector(setIconThreshold(_:))
         ))
         sub.addItem(mutedItem())
+        let updates = NSMenuItem(title: "Check for updates", action: #selector(toggleUpdateCheck(_:)), keyEquivalent: "")
+        updates.target = self
+        updates.state = Settings.checkForUpdates ? .on : .off
+        updates.isEnabled = true
+        sub.addItem(updates)
         settings.submenu = sub
         menu.addItem(settings)
 
