@@ -72,9 +72,11 @@ struct ProcInfo {
     let path: String
 }
 
+// Only CPU per pid: the window average needs nothing else, and names and
+// paths for ~1000 processes per sample cost ~8x the memory.
 struct Sample {
     let date: Date
-    let procs: [Int32: ProcInfo]
+    let cpu: [Int32: Double]
 }
 
 // MARK: - App
@@ -83,11 +85,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var samples: [Sample] = []
+    private var latest: [Int32: ProcInfo] = [:] // full info from the newest sample
     private var hotSince: [Int32: Date] = [:]
     private var coolStreak: [Int32: Int] = [:]
     private var lastNotified: [Int32: Date] = [:]
     private var timer: Timer?
     private var fastTimer: Timer?
+    private var notificationsDenied = false
 
     // MARK: Launch
 
@@ -114,24 +118,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: Sampling
 
     private func tick() {
+        refreshNotificationStatus()
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            // Stamp the sample when ps runs: the main-queue block below waits
+            // while the dropdown is open, and a late stamp would look like a
+            // sleep gap to ingest.
+            let now = Date()
             guard let procs = Self.readProcesses() else { return }
             DispatchQueue.main.async {
-                self?.ingest(procs)
+                self?.ingest(procs, at: now)
             }
         }
     }
 
-    private func ingest(_ procs: [Int32: ProcInfo]) {
-        let now = Date()
+    private func ingest(_ procs: [Int32: ProcInfo], at now: Date) {
         // After sleep/wake there's a gap in samples; sustained-load state is
         // no longer meaningful, so reset it rather than counting sleep time.
         if let last = samples.last, now.timeIntervalSince(last.date) > tickInterval * 3 {
             hotSince.removeAll()
             coolStreak.removeAll()
         }
-        samples.append(Sample(date: now, procs: procs))
+        samples.append(Sample(date: now, cpu: procs.mapValues { $0.cpu }))
         samples.removeAll { now.timeIntervalSince($0.date) > Settings.avgWindow }
+        latest = procs
         updateAlerts(procs: procs, now: now)
         updateStatusIcon()
     }
@@ -140,6 +149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-Axo", "pid=,pcpu=,comm="]
+        // ps formats pcpu with the locale's decimal separator ("0,4" under
+        // nl_BE), which Double() rejects.
+        p.environment = ["LC_ALL": "C"]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
@@ -239,10 +251,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // Orange as an early warning: something is above the icon threshold in
     // the latest sample, before the sustained-duration notification fires.
     private func updateStatusIcon() {
-        let procs = samples.last?.procs ?? [:]
         let threshold = Settings.iconThreshold
         let muted = Set(Settings.mutedNames)
-        let hot = threshold <= 0 ? nil : procs.values
+        let hot = threshold <= 0 ? nil : latest.values
             .filter { $0.cpu >= threshold && !muted.contains($0.name) }
             .max { $0.cpu < $1.cpu }
         if let button = statusItem.button {
@@ -265,7 +276,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private func configureNotifications() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            self?.refreshNotificationStatus()
+        }
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: Note.category,
@@ -278,6 +291,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 options: []
             ),
         ])
+    }
+
+    // The user can change the permission in System Settings at any time;
+    // tick() refreshes it so the dropdown can say when alerts can't show.
+    private func refreshNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let denied = settings.authorizationStatus == .denied
+            DispatchQueue.main.async {
+                self?.notificationsDenied = denied
+            }
+        }
     }
 
     func userNotificationCenter(
@@ -319,7 +343,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         guard pid > 0,
               let path = Self.fullPath(of: pid),
               (path as NSString).lastPathComponent == name else { return }
-        kill(pid, signal)
+        if kill(pid, signal) != 0 {
+            notifyKillFailed(pid: pid, name: name, error: String(cString: strerror(errno)))
+        }
+    }
+
+    // The notification has no alert window to report into, so a failed
+    // kill (EPERM for root-owned processes) gets a notification of its own.
+    private func notifyKillFailed(pid: Int32, name: String, error: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Could not kill \(name)"
+        content.body = "kill(\(pid)) failed: \(error)"
+        let req = UNNotificationRequest(
+            identifier: "hogwatch-killfail-\(pid)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req)
     }
 
     // MARK: Dropdown
@@ -421,15 +461,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private func topEntries(in window: [Sample]) -> [TopEntry] {
         var totals: [Int32: Double] = [:]
         for sample in window {
-            for (pid, info) in sample.procs {
-                totals[pid, default: 0] += info.cpu
+            for (pid, cpu) in sample.cpu {
+                totals[pid, default: 0] += cpu
             }
         }
-        let current = window.last!.procs
         let sampleCount = Double(window.count)
         let ranked = totals
             .compactMap { pid, total -> TopEntry? in
-                guard let info = current[pid] else { return nil }
+                guard let info = latest[pid] else { return nil }
                 return TopEntry(pid: pid, name: info.name, path: info.path,
                                 avg: total / sampleCount, nowCpu: info.cpu)
             }
@@ -551,6 +590,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func addFooter(to menu: NSMenu) {
         menu.addItem(.separator())
+
+        if notificationsDenied {
+            let off = NSMenuItem(
+                title: "Notifications are off — allow them in System Settings",
+                action: nil,
+                keyEquivalent: ""
+            )
+            off.isEnabled = false
+            menu.addItem(off)
+        }
 
         let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         settings.isEnabled = true
