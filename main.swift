@@ -79,6 +79,121 @@ struct Sample {
     let cpu: [Int32: Double]
 }
 
+// MARK: - Graph
+
+struct GraphSeries {
+    let name: String
+    let color: NSColor
+    let points: [(x: Double, y: Double)] // x: 0...1 across the window; y: percent of one core
+}
+
+// CPU history at the top of the dropdown, styled after Hot's graph
+// (github.com/macmade/hot): a faint rounded box, grid lines, one line per
+// process, the alert threshold dashed, and a legend.
+final class GraphView: NSView {
+    var series: [GraphSeries] = [] { didSet { needsDisplay = true } }
+    var threshold: Double = 0 { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let box = bounds.insetBy(dx: 14, dy: 4)
+        let outline = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10)
+        NSColor.controlTextColor.withAlphaComponent(0.05).setFill()
+        outline.fill()
+        NSColor.controlTextColor.withAlphaComponent(0.2).setStroke()
+        outline.stroke()
+
+        // The legend row sits below the plot, inside the box.
+        let plot = NSRect(x: box.minX + 10, y: box.minY + 26, width: box.width - 20, height: box.height - 36)
+        // ps pcpu exceeds 100% for multi-threaded processes; round the
+        // scale up to the next 50 so the highest line stays inside.
+        let peak = series.flatMap { $0.points.map(\.y) }.max() ?? 0
+        let top = (max(100, threshold, peak) / 50).rounded(.up) * 50
+        func point(_ x: Double, _ y: Double) -> NSPoint {
+            NSPoint(x: plot.minX + plot.width * x, y: plot.minY + plot.height * y / top)
+        }
+
+        NSColor.controlTextColor.withAlphaComponent(0.075).setStroke()
+        for i in 1...3 {
+            let y = plot.minY + plot.height * CGFloat(i) / 4
+            let grid = NSBezierPath()
+            grid.move(to: NSPoint(x: plot.minX, y: y))
+            grid.line(to: NSPoint(x: plot.maxX, y: y))
+            grid.stroke()
+        }
+
+        let alertColor = NSColor.systemRed.withAlphaComponent(0.6)
+        if threshold > 0 {
+            let y = point(0, threshold).y
+            let dash = NSBezierPath()
+            dash.move(to: NSPoint(x: plot.minX, y: y))
+            dash.line(to: NSPoint(x: plot.maxX, y: y))
+            dash.setLineDash([4, 3], count: 2, phase: 0)
+            alertColor.setStroke()
+            dash.stroke()
+        }
+
+        // Back to front, so the hottest process draws on top; only it gets
+        // a gradient fill, since overlapping fills turn to mud.
+        for (index, s) in series.enumerated().reversed() where s.points.count >= 2 {
+            let line = NSBezierPath()
+            line.move(to: point(s.points[0].x, s.points[0].y))
+            for p in s.points.dropFirst() { line.line(to: point(p.x, p.y)) }
+
+            if index == 0 {
+                let fill = line.copy() as! NSBezierPath
+                fill.line(to: NSPoint(x: point(s.points.last!.x, 0).x, y: plot.minY))
+                fill.line(to: NSPoint(x: point(s.points[0].x, 0).x, y: plot.minY))
+                fill.close()
+                NSGradient(colors: [s.color.withAlphaComponent(0.35), s.color.withAlphaComponent(0)])?
+                    .draw(in: fill, angle: -90)
+            }
+
+            line.lineWidth = 2
+            line.lineCapStyle = .round
+            line.lineJoinStyle = .round
+            s.color.withAlphaComponent(0.85).setStroke()
+            line.stroke()
+        }
+
+        // Legend: a dot and name per series, and the threshold at the right
+        // end. A label on the dashed line itself would sit under the lines.
+        let truncating = NSMutableParagraphStyle()
+        truncating.lineBreakMode = .byTruncatingTail
+        let legendAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10),
+            .foregroundColor: NSColor.controlTextColor.withAlphaComponent(0.75),
+            .paragraphStyle: truncating,
+        ]
+        let y = box.minY + 9
+        var seriesWidth = plot.width
+        if threshold > 0 {
+            let label = "alert \(Int(threshold))%" as NSString
+            var attrs = legendAttrs
+            attrs[.foregroundColor] = alertColor
+            let width = ceil(label.size(withAttributes: attrs).width)
+            let labelX = plot.maxX - width
+            label.draw(in: NSRect(x: labelX, y: y - 1, width: width, height: 13), withAttributes: attrs)
+            let swatch = NSBezierPath()
+            swatch.move(to: NSPoint(x: labelX - 18, y: y + 5.5))
+            swatch.line(to: NSPoint(x: labelX - 4, y: y + 5.5))
+            swatch.setLineDash([4, 3], count: 2, phase: 0)
+            alertColor.setStroke()
+            swatch.stroke()
+            seriesWidth -= width + 30
+        }
+        let slot = seriesWidth / 3
+        for (index, s) in series.prefix(3).enumerated() {
+            let x = plot.minX + slot * CGFloat(index)
+            s.color.withAlphaComponent(0.85).setFill()
+            NSBezierPath(ovalIn: NSRect(x: x, y: y + 2, width: 7, height: 7)).fill()
+            (s.name as NSString).draw(
+                in: NSRect(x: x + 11, y: y - 1, width: slot - 19, height: 13),
+                withAttributes: legendAttrs
+            )
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
@@ -377,6 +492,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             return
         }
 
+        let entries = topEntries(in: window)
+        if window.count >= 2 {
+            menu.addItem(graphItem(for: Array(entries.prefix(3)), window: window))
+        }
+
         let minutes = max(Int(now.timeIntervalSince(window.first!.date) / 60), 1)
         let captions = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         captions.isEnabled = false
@@ -387,11 +507,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(captions)
         menu.addItem(.separator())
 
-        for entry in topEntries(in: window) {
+        for entry in entries {
             menu.addItem(rowItem(for: entry, minutes: minutes))
         }
 
         addFooter(to: menu)
+    }
+
+    private static let seriesColors: [NSColor] = [.systemOrange, .systemBlue, .systemPurple]
+
+    // One line per entry over the window; a sample where the pid was absent
+    // counts as 0, as in the avg column.
+    private func graphItem(for entries: [TopEntry], window: [Sample]) -> NSMenuItem {
+        let start = window.first!.date
+        let span = max(window.last!.date.timeIntervalSince(start), 1)
+        let view = GraphView(frame: NSRect(x: 0, y: 0, width: 300, height: 110))
+        // The menu stretches a width-sizable view to its own width.
+        view.autoresizingMask = [.width]
+        view.threshold = Settings.alertThreshold
+        view.series = zip(entries, Self.seriesColors).map { entry, color in
+            GraphSeries(
+                name: entry.name,
+                color: color,
+                points: window.map { (x: $0.date.timeIntervalSince(start) / span, y: $0.cpu[entry.pid] ?? 0) }
+            )
+        }
+        let item = NSMenuItem()
+        item.view = view
+        return item
     }
 
     // While the dropdown is open, sample fast and refresh the now column of
