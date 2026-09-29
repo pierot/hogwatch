@@ -12,6 +12,7 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 
 - Samples `ps` every 30 seconds and keeps a sliding window (default 15 minutes).
 - The dropdown ranks the top 10 living processes by average CPU over that window, with app icons, pid, and a now column that refreshes every second while the menu is open.
+- A graph at the top of the dropdown shows the CPU history of the top 3 processes over the window, with the alert threshold as a dashed line.
 - Click a row to kill the process (SIGTERM or SIGKILL, with confirmation).
 - When a process stays above a threshold (default 90% of one core) for a sustained period (default 30 minutes), you get a notification with Kill, Force Kill, and Mute buttons.
 - The menu bar icon turns orange as soon as anything crosses the icon threshold, before the notification fires. Hover it to see the culprit.
