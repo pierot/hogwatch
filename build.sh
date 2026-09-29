@@ -26,6 +26,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>${VERSION}</string>
+	<key>CFBundleVersion</key>
+	<string>${VERSION}</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

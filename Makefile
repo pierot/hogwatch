@@ -6,6 +6,9 @@ build:
 # Tag a new version and push it; GitHub Actions builds and publishes the release.
 release:
 	@if ! git diff-index --quiet HEAD --; then echo "Working tree is dirty; commit first."; exit 1; fi
+	@if [ "$$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then echo "Not on main; switch to main first."; exit 1; fi
+	@git fetch --quiet origin main
+	@if ! git merge-base --is-ancestor origin/main HEAD; then echo "main is behind origin/main; pull first."; exit 1; fi
 	@last=$$(git tag --sort=-v:refname | head -1); \
 	if [ -z "$$last" ]; then \
 		new="v1.0"; \

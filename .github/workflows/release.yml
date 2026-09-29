@@ -10,9 +10,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build universal app
         run: |
@@ -41,7 +41,7 @@ jobs:
 
       - name: Upload artifact (non-tag run)
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Hogwatch-${{ env.VERSION }}
           path: Hogwatch-${{ env.VERSION }}.zip

@@ -58,7 +58,7 @@ Everything lives under the Settings item in the dropdown and persists in UserDef
 | Orange above | 90% | Icon early-warning threshold, independent of the alert; can be off |
 | Muted alerts | none | Per-name mute list, fed by the notification's Mute button |
 
-## Semantics worth knowing
+## Semantics
 
 - CPU percentages come from `ps` pcpu: percent of one core, itself a decaying average over roughly the last minute, so spikes ramp over a few seconds rather than jumping.
 - The avg column counts samples where a process was absent as 0%, so it effectively ranks by total CPU consumed over the window.
