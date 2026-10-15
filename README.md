@@ -11,7 +11,7 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 ## What it does
 
 - Samples `ps` every 30 seconds and keeps a sliding window (default 15 minutes).
-- The dropdown ranks the top 10 living processes by average CPU over that window, with app icons, pid, and a now column that refreshes every second while the menu is open.
+- The dropdown ranks the top 10 living processes by average CPU over that window, with app icons, pid, a now column, and a mem column. The now and mem columns refresh every second while the menu is open.
 - A graph at the top of the dropdown shows the CPU history of the top 3 processes over the window, with the alert threshold as a dashed line.
 - Click a row to kill the process (SIGTERM or SIGKILL, with confirmation).
 - When a process stays above a threshold (default 90% of one core) for a sustained period (default 30 minutes), you get a notification with Kill, Force Kill, and Mute buttons.
@@ -44,6 +44,8 @@ open Hogwatch.app
 
 `build.sh` produces a universal (arm64 + x86_64) ad-hoc-signed bundle, so the same app copies to another Mac. If you transfer it with AirDrop, clear the quarantine flag first: `xattr -dr com.apple.quarantine Hogwatch.app`.
 
+`make test` compiles `main.swift` with `tests.swift` and runs the tests.
+
 To start it at login, add Hogwatch.app to System Settings > General > Login Items. Allow notifications when it asks.
 
 Requires macOS 13 or later.
@@ -65,11 +67,12 @@ Everything lives under the Settings item in the dropdown and persists in UserDef
 
 - CPU percentages come from `ps` pcpu: percent of one core, itself a decaying average over roughly the last minute, so spikes ramp over a few seconds rather than jumping.
 - The avg column counts samples where a process was absent as 0%, so it effectively ranks by total CPU consumed over the window.
+- The mem column is the resident set size (`ps` rss) in the latest sample. It counts shared framework pages and leaves out compressed memory, so it differs from the Memory column in Activity Monitor. Memory has no alerts and does not affect the ranking.
 - Tracking is per pid. Browser and Electron helpers appear as separate rows, and alerts target the one runaway helper rather than the whole app.
 - The sustained-load clock only resets after 3 consecutive below-threshold samples, so a process oscillating around the threshold still triggers.
 - Sleep gaps reset sustained-load tracking; time asleep does not count toward the alert duration.
 - After notifying, the same pid is quiet for an hour before it can re-alert.
-- Killing from a stale notification re-checks that the pid still belongs to the same executable before sending a signal.
+- A kill from the dropdown or a notification first checks that the pid still belongs to the same process (pid and start time). If not, Hogwatch reports that the process has exited and sends no signal.
 
 ## Icon
 

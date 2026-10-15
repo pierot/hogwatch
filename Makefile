@@ -1,7 +1,13 @@
-.PHONY: build release
+.PHONY: build test release
 
 build:
 	./build.sh
+
+# Compile main.swift with tests.swift; -D TESTING swaps the app entry point for runTests().
+test:
+	@mkdir -p .build
+	swiftc -D TESTING -o .build/hogwatch-tests main.swift tests.swift
+	./.build/hogwatch-tests
 
 # Tag a new version and push it; GitHub Actions builds and publishes the release.
 release:

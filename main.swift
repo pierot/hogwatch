@@ -85,7 +85,28 @@ enum Settings {
 struct ProcInfo {
     let name: String
     let cpu: Double
+    let rss: Int // resident set size in KiB, as ps reports it
     let path: String
+
+    // Parses `ps -Axo pid=,pcpu=,rss=,comm=` output; comm comes last because
+    // it can contain spaces.
+    static func parse(_ out: String, fullPath: (Int32) -> String?) -> [Int32: ProcInfo] {
+        var result: [Int32: ProcInfo] = [:]
+        for line in out.split(separator: "\n") {
+            let tokens = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard tokens.count >= 4,
+                  let pid = Int32(tokens[0]),
+                  let cpu = Double(tokens[1]),
+                  let rss = Int(tokens[2]) else { continue }
+            // ps truncates long comm paths even with -ww; proc_pidpath
+            // gives the full executable path.
+            let comm = tokens[3...].joined(separator: " ")
+            let path = fullPath(pid) ?? comm
+            let name = (path as NSString).lastPathComponent
+            result[pid] = ProcInfo(name: name, cpu: cpu, rss: rss, path: path)
+        }
+        return result
+    }
 }
 
 // Only CPU per pid: the window average needs nothing else, and names and
@@ -297,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private static func readProcesses() -> [Int32: ProcInfo]? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-Axo", "pid=,pcpu=,comm="]
+        p.arguments = ["-Axo", "pid=,pcpu=,rss=,comm="]
         // ps formats pcpu with the locale's decimal separator ("0,4" under
         // nl_BE), which Double() rejects.
         p.environment = ["LC_ALL": "C"]
@@ -308,27 +329,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
-
-        var result: [Int32: ProcInfo] = [:]
-        for line in out.split(separator: "\n") {
-            let tokens = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard tokens.count >= 3,
-                  let pid = Int32(tokens[0]),
-                  let cpu = Double(tokens[1]) else { continue }
-            // ps truncates long comm paths even with -ww; proc_pidpath
-            // gives the full executable path.
-            let comm = tokens[2...].joined(separator: " ")
-            let path = fullPath(of: pid) ?? comm
-            let name = (path as NSString).lastPathComponent
-            result[pid] = ProcInfo(name: name, cpu: cpu, path: path)
-        }
-        return result
+        return ProcInfo.parse(out, fullPath: fullPath(of:))
     }
 
     private static func fullPath(of pid: Int32) -> String? {
         var buf = [CChar](repeating: 0, count: 4096)
         guard proc_pidpath(pid, &buf, 4096) > 0 else { return nil }
         return String(cString: buf)
+    }
+
+    // Start time in microseconds since 1970. With the pid, it identifies a
+    // process across pid reuse; sysctl reads it for every user's process.
+    static func startTime(of pid: Int32) -> Int? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let start = info.kp_proc.p_starttime
+        return Int(start.tv_sec) * 1_000_000 + Int(start.tv_usec)
     }
 
     // MARK: Alerts
@@ -357,24 +375,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
 
+        // A pid absent from the sample has exited; a new process that reuses
+        // it must not inherit the cooldown.
+        lastNotified = lastNotified.filter { procs[$0.key] != nil }
+
         let muted = Set(Settings.mutedNames)
         for (pid, since) in hotSince {
             guard now.timeIntervalSince(since) >= Settings.alertDuration else { continue }
             guard let info = procs[pid], !muted.contains(info.name) else { continue }
             if let last = lastNotified[pid], now.timeIntervalSince(last) < renotifyCooldown { continue }
+            // No start time means the process exited after the sample.
+            guard let start = Self.startTime(of: pid) else { continue }
             lastNotified[pid] = now
-            notify(pid: pid, name: info.name, since: since, now: now)
+            notify(pid: pid, start: start, name: info.name, since: since, now: now)
         }
     }
 
-    private func notify(pid: Int32, name: String, since: Date, now: Date) {
+    private func notify(pid: Int32, start: Int, name: String, since: Date, now: Date) {
         let content = UNMutableNotificationContent()
         let mins = Int(now.timeIntervalSince(since) / 60)
         content.title = "High CPU: \(name)"
         content.body = "\(name) (pid \(pid)) has been above \(Int(Settings.alertThreshold))% of a core for \(mins) minutes."
         content.sound = .default
         content.categoryIdentifier = Note.category
-        content.userInfo = ["pid": Int(pid), "name": name]
+        content.userInfo = ["pid": Int(pid), "start": start, "name": name]
         let req = UNNotificationRequest(
             identifier: "hogwatch-\(pid)-\(Int(since.timeIntervalSince1970))",
             content: content,
@@ -541,14 +565,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     ) {
         let info = response.notification.request.content.userInfo
         let pid = Int32(info["pid"] as? Int ?? -1)
+        let start = info["start"] as? Int
         let name = info["name"] as? String ?? ""
         let url = (info["url"] as? String).flatMap { URL(string: $0) }
         let action = response.actionIdentifier
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             switch action {
-            case Note.kill: self.killIfStillNamed(pid: pid, name: name, signal: SIGTERM)
-            case Note.forceKill: self.killIfStillNamed(pid: pid, name: name, signal: SIGKILL)
+            case Note.kill: self.killFromNotification(pid: pid, start: start, name: name, signal: SIGTERM)
+            case Note.forceKill: self.killFromNotification(pid: pid, start: start, name: name, signal: SIGKILL)
             case Note.mute:
                 if !name.isEmpty {
                     Settings.mute(name)
@@ -564,23 +589,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         completionHandler()
     }
 
-    // A notification can be acted on long after it fired and the pid may
-    // have been reused; only signal if it still names the same executable.
-    private func killIfStillNamed(pid: Int32, name: String, signal: Int32) {
-        guard pid > 0,
-              let path = Self.fullPath(of: pid),
-              (path as NSString).lastPathComponent == name else { return }
-        if kill(pid, signal) != 0 {
-            notifyKillFailed(pid: pid, name: name, error: String(cString: strerror(errno)))
+    private func killFromNotification(pid: Int32, start: Int?, name: String, signal: Int32) {
+        if let reason = Self.sendSignal(pid: pid, start: start, signal) {
+            notifyKillFailed(pid: pid, name: name, reason: reason)
         }
     }
 
     // The notification has no alert window to report into, so a failed
     // kill (EPERM for root-owned processes) gets a notification of its own.
-    private func notifyKillFailed(pid: Int32, name: String, error: String) {
+    private func notifyKillFailed(pid: Int32, name: String, reason: String) {
         let content = UNMutableNotificationContent()
         content.title = "Could not kill \(name)"
-        content.body = "kill(\(pid)) failed: \(error)"
+        content.body = reason
         let req = UNNotificationRequest(
             identifier: "hogwatch-killfail-\(pid)",
             content: content,
@@ -683,14 +703,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         guard let procs = (box as? ProcsBox)?.procs else { return }
         for item in menu.items {
             guard let entry = item.representedObject as? TopEntry else { continue }
-            if let cpu = procs[entry.pid]?.cpu {
+            if let info = procs[entry.pid] {
                 item.attributedTitle = Self.rowTitle(
                     avg: entry.avg, name: entry.name, pid: entry.pid,
-                    now: String(format: "%.0f%%", cpu)
+                    now: String(format: "%.0f%%", info.cpu), mem: Self.memoryText(kib: info.rss)
                 )
             } else {
                 item.attributedTitle = Self.rowTitle(
-                    avg: entry.avg, name: entry.name, pid: entry.pid, now: "exited"
+                    avg: entry.avg, name: entry.name, pid: entry.pid, now: "exited", mem: ""
                 )
                 item.isEnabled = false
             }
@@ -705,10 +725,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private struct TopEntry {
         let pid: Int32
+        let start: Int?    // nil when the process exited before the menu opened
         let name: String
         let path: String
         let avg: Double    // mean over the window, absent samples counting as 0
         let nowCpu: Double // latest sample
+        let rss: Int       // latest sample, KiB
     }
 
     // Ranks by total CPU consumed over the window, expressed as an average.
@@ -722,25 +744,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         let sampleCount = Double(window.count)
         let ranked = totals
-            .compactMap { pid, total -> TopEntry? in
+            .compactMap { pid, total -> (pid: Int32, info: ProcInfo, total: Double)? in
                 guard let info = latest[pid] else { return nil }
-                return TopEntry(pid: pid, name: info.name, path: info.path,
-                                avg: total / sampleCount, nowCpu: info.cpu)
+                return (pid, info, total)
             }
-            .sorted { $0.avg > $1.avg }
-        return Array(ranked.prefix(topCount))
+            .sorted { $0.total > $1.total }
+            .prefix(topCount)
+        // Start times only for the listed rows: one sysctl each.
+        return ranked.map { r in
+            TopEntry(pid: r.pid, start: Self.startTime(of: r.pid), name: r.info.name, path: r.info.path,
+                     avg: r.total / sampleCount, nowCpu: r.info.cpu, rss: r.info.rss)
+        }
     }
 
     private func rowItem(for entry: TopEntry, minutes: Int) -> NSMenuItem {
         let now = String(format: "%.0f%%", entry.nowCpu)
+        let mem = Self.memoryText(kib: entry.rss)
         let item = NSMenuItem(title: "\(entry.name) [\(entry.pid)]", action: #selector(killTapped(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = entry
-        item.attributedTitle = Self.rowTitle(avg: entry.avg, name: entry.name, pid: entry.pid, now: now)
+        item.attributedTitle = Self.rowTitle(avg: entry.avg, name: entry.name, pid: entry.pid, now: now, mem: mem)
         item.image = Self.icon(pid: entry.pid, path: entry.path)
         item.toolTip = String(
-            format: "%@ averaged %.1f%% of a core over the last %d min, %@ in the latest sample. Click to kill it.",
-            entry.name, entry.avg, minutes, now
+            format: "%@ averaged %.1f%% of a core over the last %d min, %@ in the latest sample, with %@ resident memory. Click to kill it.",
+            entry.name, entry.avg, minutes, now, mem
         )
         item.isEnabled = true
         return item
@@ -755,6 +782,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             NSTextTab(textAlignment: .left, location: 60),    // name
             NSTextTab(textAlignment: .right, location: 288),  // pid
             NSTextTab(textAlignment: .right, location: 344),  // now
+            NSTextTab(textAlignment: .right, location: 414),  // mem
         ]
         p.lineBreakMode = .byClipping
         return p
@@ -766,10 +794,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             .foregroundColor: NSColor.secondaryLabelColor,
             .paragraphStyle: rowParagraphStyle,
         ]
-        return NSAttributedString(string: "\tavg \(minutes)m\tprocess\tpid\tnow", attributes: attrs)
+        return NSAttributedString(string: "\tavg \(minutes)m\tprocess\tpid\tnow\tmem", attributes: attrs)
     }
 
-    private static func rowTitle(avg: Double, name: String, pid: Int32, now: String) -> NSAttributedString {
+    private static func rowTitle(avg: Double, name: String, pid: Int32, now: String, mem: String) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         // No explicit foreground color on the main columns so AppKit can
         // swap it for the highlight color on hover.
@@ -785,7 +813,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         s.append(NSAttributedString(string: "\t\(shown)", attributes: main))
         s.append(NSAttributedString(string: "\t\(pid)", attributes: dim))
         s.append(NSAttributedString(string: "\t\(now)", attributes: dim))
+        s.append(NSAttributedString(string: "\t\(mem)", attributes: dim))
         return s
+    }
+
+    // Binary units under the MB/GB labels, as Activity Monitor shows them;
+    // String(format:) keeps the decimal point fixed like the CPU columns.
+    static func memoryText(kib: Int) -> String {
+        let mib = kib / 1024
+        if mib < 1024 { return "\(mib) MB" }
+        return String(format: "%.1f GB", Double(kib) / 1_048_576)
     }
 
     private static func icon(pid: Int32, path: String) -> NSImage {
@@ -830,15 +867,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         default: return
         }
 
-        if kill(target.pid, sig) != 0 {
-            let err = String(cString: strerror(errno))
+        if let reason = Self.sendSignal(pid: target.pid, start: target.start, sig) {
             let fail = NSAlert()
             fail.messageText = "Could not kill \(target.name)"
-            fail.informativeText = "kill(\(target.pid)) failed: \(err)"
+            fail.informativeText = reason
             fail.alertStyle = .critical
             fail.addButton(withTitle: "OK")
             fail.runModal()
         }
+    }
+
+    // A row or notification can be acted on long after its sample, and the
+    // pid may belong to another process by then. Signal only the process
+    // that started at `start`; returns why no signal went out, or nil.
+    private static func sendSignal(pid: Int32, start: Int?, _ sig: Int32) -> String? {
+        guard pid > 0, let start, startTime(of: pid) == start else {
+            return "pid \(pid) has exited"
+        }
+        if kill(pid, sig) != 0 {
+            return "kill(\(pid)) failed: \(String(cString: strerror(errno)))"
+        }
+        return nil
     }
 
     // MARK: Settings menu
@@ -1000,8 +1049,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
 // MARK: - Entry point
 
+// `make test` compiles this file with tests.swift under -D TESTING.
+#if TESTING
+runTests()
+#else
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+#endif
