@@ -1,6 +1,7 @@
 // Tests for the logic in main.swift that runs without the app. Run with
 // `make test`, which compiles both files with -D TESTING.
 import Foundation
+import ServiceManagement
 
 private var failures = 0
 
@@ -15,6 +16,7 @@ func runTests() {
     testParse()
     testMemoryText()
     testStartTime()
+    testLoginItemAction()
 
     print(failures == 0 ? "All tests passed." : "\(failures) test(s) failed.")
     exit(failures == 0 ? 0 : 1)
@@ -69,4 +71,11 @@ private func testStartTime() {
            "the test process started in the last minute, in microseconds since 1970")
     expect(AppDelegate.startTime(of: getpid()) == own, "start time is stable")
     expect(AppDelegate.startTime(of: Int32.max) == nil, "no start time for a pid that does not exist")
+}
+
+private func testLoginItemAction() {
+    expect(LoginItem.action(for: .enabled) == .unregister, "a click on an enabled login item unregisters it")
+    expect(LoginItem.action(for: .notRegistered) == .register, "a click on an unregistered login item registers it")
+    expect(LoginItem.action(for: .notFound) == .register, "an app that never registered reports notFound")
+    expect(LoginItem.action(for: .requiresApproval) == .openSettings, "only System Settings can approve a denied login item")
 }

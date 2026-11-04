@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import UserNotifications
 
 // MARK: - Configuration
@@ -77,6 +78,23 @@ enum Settings {
             "iconThreshold": 90.0,
             "checkForUpdates": true,
         ])
+    }
+}
+
+// MARK: - Login item
+
+// Whether the app starts at login. Not in Settings: the user can also change
+// it in System Settings, so only SMAppService's status is reliable.
+enum LoginItem {
+    enum Action { case register, unregister, openSettings }
+
+    // An app that never registered reports .notFound, not .notRegistered.
+    static func action(for status: SMAppService.Status) -> Action {
+        switch status {
+        case .enabled: return .unregister
+        case .requiresApproval: return .openSettings
+        default: return .register
+        }
     }
 }
 
@@ -954,6 +972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         updates.state = Settings.checkForUpdates ? .on : .off
         updates.isEnabled = true
         sub.addItem(updates)
+        sub.addItem(startAtLoginItem())
         settings.submenu = sub
         menu.addItem(settings)
 
@@ -989,6 +1008,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         parent.submenu = sub
         return parent
+    }
+
+    private func startAtLoginItem() -> NSMenuItem {
+        let status = SMAppService.mainApp.status
+        let needsApproval = status == .requiresApproval
+        let item = NSMenuItem(
+            title: needsApproval ? "Start at login (needs approval)…" : "Start at login",
+            action: #selector(toggleLoginItem(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.state = needsApproval ? .mixed : (status == .enabled ? .on : .off)
+        item.isEnabled = true
+        return item
     }
 
     private func mutedItem() -> NSMenuItem {
@@ -1038,6 +1071,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         guard let value = sender.representedObject as? Double else { return }
         Settings.iconThreshold = value
         updateStatusIcon()
+    }
+
+    @objc private func toggleLoginItem(_ sender: NSMenuItem) {
+        let service = SMAppService.mainApp
+        do {
+            switch LoginItem.action(for: service.status) {
+            case .register: try service.register()
+            case .unregister: try service.unregister()
+            case .openSettings: SMAppService.openSystemSettingsLoginItems()
+            }
+        } catch {
+            NSApp.activate(ignoringOtherApps: true)
+            let fail = NSAlert()
+            fail.messageText = "Could not change the login item"
+            fail.informativeText = error.localizedDescription
+            fail.alertStyle = .critical
+            fail.addButton(withTitle: "OK")
+            fail.runModal()
+        }
     }
 
     @objc private func unmuteTapped(_ sender: NSMenuItem) {

@@ -46,13 +46,13 @@ open Hogwatch.app
 
 `make test` compiles `main.swift` with `tests.swift` and runs the tests.
 
-To start it at login, add Hogwatch.app to System Settings > General > Login Items. Allow notifications when it asks.
+To start it at login, turn on Settings > Start at login in the dropdown. If you added Hogwatch.app to System Settings > General > Login Items yourself, remove that entry first. Allow notifications when it asks.
 
 Requires macOS 13 or later.
 
 ## Settings
 
-Everything lives under the Settings item in the dropdown and persists in UserDefaults (`be.jackjoe.hogwatch`):
+Everything lives under the Settings item in the dropdown. macOS keeps the Start at login state; the other settings persist in UserDefaults (`be.jackjoe.hogwatch`):
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -62,6 +62,7 @@ Everything lives under the Settings item in the dropdown and persists in UserDef
 | Orange above | 90% | Icon early-warning threshold, independent of the alert; can be off |
 | Muted alerts | none | Per-name mute list, fed by the notification's Mute button |
 | Check for updates | on | Daily check for a new GitHub release |
+| Start at login | off | Starts Hogwatch at login. In System Settings > General > Login Items, switching it off also quits Hogwatch; the item then shows "needs approval" and opens that pane |
 
 ## Semantics
 
