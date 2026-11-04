@@ -1,4 +1,5 @@
 import AppKit
+import Security
 import ServiceManagement
 import UserNotifications
 
@@ -132,6 +133,393 @@ struct ProcInfo {
 struct Sample {
     let date: Date
     let cpu: [Int32: Double]
+}
+
+// MARK: - Process details
+
+// What a row says about a process beyond the ps columns. ProcLookup reads the
+// stored fields from the system; displayName and tooltip only derive from them.
+struct ProcDetails {
+    let name: String             // executable name; the mute list keys on it
+    let path: String
+    var argv: [String] = []      // empty for another user's process
+    var folder: String? = nil    // working directory; same limit as argv
+    var app: String? = nil       // the app that contains the executable, or the name macOS gives the process
+    var isAppExecutable = false  // the process is that app, not one of its helpers
+    var owner: String? = nil     // the app it works for, when no app contains the executable
+    var parent: String? = nil    // "zsh [4814]"
+    var publisher: String? = nil
+    var user: String? = nil      // set only for another user's process
+    var about: String? = nil     // man page summary of a system binary
+
+    var displayName: String {
+        if isSystemBinary, let known = Self.systemNames[name] { return known }
+        if let app {
+            if let helperRole { return "\(app): \(helperRole)" }
+            if isAppExecutable { return app }
+            return name.localizedCaseInsensitiveContains(app) ? name : "\(app): \(name)"
+        }
+        return runtimeLabel ?? commandName ?? name
+    }
+
+    var tooltip: String {
+        let shown = displayName
+        var lines = [shown]
+        func add(_ label: String, _ value: String?) {
+            if let value { lines.append("\(label): \(value)") }
+        }
+        if shown.caseInsensitiveCompare(name) != .orderedSame { add("Process", name) }
+        add("About", about)
+        if let application = owner ?? app, application != shown, application != name {
+            add("Application", application)
+        }
+        add("Part of", framework.map { "\($0) framework" })
+        add("Parent", parent)
+        add("Publisher", publisher)
+        add("User", user)
+        // The root says nothing, and the Path line shows a folder that holds the executable.
+        if let folder, folder != "/", !path.hasPrefix(folder + "/") {
+            add("Folder", (folder as NSString).abbreviatingWithTildeInPath)
+        }
+        add("Command", command)
+        add("Path", (path as NSString).abbreviatingWithTildeInPath)
+        return lines.joined(separator: "\n")
+    }
+
+    // The daemon table and /usr/share/man describe these binaries only; another
+    // binary with the same name would get the wrong text.
+    var isSystemBinary: Bool {
+        ["/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/"].contains { path.hasPrefix($0) }
+    }
+
+    // Chromium and Electron pass the role of a helper in flags. The binary
+    // name is not reliable: "Google Chrome Helper (Aperitif Renderer)".
+    private var helperRole: String? {
+        if name == "plugin-container", let last = argv.last { return Self.firefoxRoles[last] }
+        guard let type = flag("--type=") else { return nil }
+        if argv.contains("--extension-process") { return "Extension" }
+        if type == "gpu-process" { return "GPU" }
+        // "video_capture.mojom.VideoCaptureService" gives "Video Capture".
+        if type == "utility", let service = flag("--utility-sub-type=")?.split(separator: ".").first {
+            return Self.title(String(service))
+        }
+        return Self.title(type)
+    }
+
+    private func flag(_ prefix: String) -> String? {
+        argv.first { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
+    }
+
+    private static func title(_ word: String) -> String {
+        word.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ").capitalized
+    }
+
+    // The name of a runtime says little; what it runs says more.
+    private var runtimeLabel: String? {
+        if name == "beam.smp" {
+            let runtime = argv.contains("-elixir_root") ? "Elixir" : "Erlang"
+            guard let folder, folder != "/", folder != NSHomeDirectory() else { return runtime }
+            return "\(runtime): \((folder as NSString).lastPathComponent)"
+        }
+        let runtime = name.hasPrefix("python") ? "python" : name
+        guard Self.scriptRuntimes.contains(runtime) else { return nil }
+        for arg in argv.dropFirst() {
+            if ["-c", "-e", "--eval"].contains(arg) { return nil } // code, not a script
+            if !arg.hasPrefix("-") { return "\(runtime): \((arg as NSString).lastPathComponent)" }
+        }
+        return nil
+    }
+
+    // argv[0] when it says more than the executable name: "claude" for the
+    // binary 2.1.318, "postgres: checkpointer" for a postgres worker.
+    private var commandName: String? {
+        guard var first = argv.first?.trimmingCharacters(in: .whitespaces), !first.isEmpty else { return nil }
+        if first.hasPrefix("-") { first.removeFirst() } // a login shell
+        // A process title can hold spaces and slashes; only a path shortens.
+        if first.hasPrefix("/") || !first.contains(" ") { first = (first as NSString).lastPathComponent }
+        let isIdentifier = !first.contains(" ") && first.split(separator: ".").count >= 3
+        return first == name || isIdentifier ? nil : first
+    }
+
+    private var command: String? {
+        // An app's flags are internal; its helper role already says what counts.
+        guard app == nil, !argv.isEmpty else { return nil }
+        // A process title can leave empty arguments behind, as postgres does.
+        var words = [commandName ?? name] + argv.dropFirst().filter { !$0.isEmpty }
+        // The BEAM flags are long and the same for every VM; what it runs comes after -extra.
+        if name == "beam.smp", let extra = argv.firstIndex(of: "-extra"), extra + 1 < argv.count {
+            words = Array(argv[(extra + 1)...])
+            words[0] = (words[0] as NSString).lastPathComponent
+        }
+        if words.count == 1, words[0] == name || words[0] == displayName { return nil }
+        let text = words.joined(separator: " ").replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        return text.count > 120 ? String(text.prefix(119)) + "…" : text
+    }
+
+    private var framework: String? {
+        guard isSystemBinary, let end = path.range(of: ".framework/", options: .backwards) else { return nil }
+        return (String(path[..<end.lowerBound]) as NSString).lastPathComponent
+    }
+
+    // "Developer ID Application: Anthropic PBC (Q6L2SF6YDW)" gives "Anthropic PBC".
+    static func publisher(commonName: String) -> String {
+        switch commonName {
+        case "macOS Software Signing", "Software Signing": return "Apple"
+        // Apple signs App Store apps, but it does not publish them.
+        case "Apple Mac OS Application Signing": return "Mac App Store"
+        default: break
+        }
+        guard let colon = commonName.range(of: ": ") else { return commonName }
+        let signer = String(commonName[colon.upperBound...])
+        guard signer.hasSuffix(")"), let team = signer.range(of: " (", options: .backwards) else { return signer }
+        return String(signer[..<team.lowerBound])
+    }
+
+    // The one-line description of a man page, in mdoc (.Nd) or man (.SH NAME)
+    // format. Some pages have an empty or useless one; those give nil.
+    static func manSummary(roff: String, name: String) -> String? {
+        // isNewline also splits on CRLF, which some of the pages use.
+        let lines = roff.split(whereSeparator: \.isNewline).map(String.init)
+        var text: String
+        if let line = lines.first(where: { $0.hasPrefix(".Nd ") }) {
+            text = String(line.dropFirst(4))
+        } else if let header = lines.firstIndex(where: { $0.hasPrefix(".SH") && $0.contains("NAME") }),
+                  header + 1 < lines.count, !lines[header + 1].hasPrefix(".") {
+            text = lines[header + 1]
+            if let dash = text.range(of: "\\- ") { text = String(text[dash.upperBound...]) }
+        } else {
+            return nil
+        }
+        if let comment = text.range(of: "\\\"") { text = String(text[..<comment.lowerBound]) }
+        for font in ["\\fB", "\\fI", "\\fR", "\\fP"] { text = text.replacingOccurrences(of: font, with: "") }
+        text = text.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "\"")))
+        let lower = text.lowercased()
+        let own = name.lowercased()
+        guard text.count >= 6, ![own, own + " daemon", own + " agent"].contains(lower),
+              !lower.contains("whatis database") else { return nil }
+        return text
+    }
+
+    private static let scriptRuntimes: Set<String> = ["node", "bun", "deno", "python", "ruby", "perl", "php", "sh", "bash", "zsh"]
+
+    // The last argument of a Firefox plugin-container.
+    private static let firefoxRoles = ["tab": "Tab", "rdd": "Media Decoder", "socket": "Network", "utility": "Utility"]
+
+    // macOS holds no friendly names for its daemons: launchd plists have no
+    // description, and an embedded Info.plist repeats the binary name. This
+    // table is hand-written, for the daemons that commonly use a lot of CPU.
+    private static let systemNames = [
+        "mds": "Spotlight server",
+        "mds_stores": "Spotlight index",
+        "mdworker": "Spotlight indexer",
+        "mdworker_shared": "Spotlight indexer",
+        "mdbulkimport": "Spotlight bulk import",
+        "corespotlightd": "Spotlight app content",
+        "managedcorespotlightd": "Spotlight managed content",
+        "duetexpertd": "Siri Suggestions",
+        "suggestd": "Content suggestions",
+        "assistantd": "Siri",
+        "contactsd": "Contacts",
+        "imagent": "Messages",
+        "photoanalysisd": "Photos analysis",
+        "photolibraryd": "Photos library",
+        "cloudphotod": "iCloud Photos",
+        "mediaanalysisd": "Media analysis",
+        "bird": "iCloud Drive",
+        "cloudd": "iCloud sync",
+        "fileproviderd": "Cloud file sync",
+        "nsurlsessiond": "Background downloads",
+        "softwareupdated": "Software Update",
+        "backupd": "Time Machine",
+        "backupd-helper": "Time Machine helper",
+        "WindowServer": "Window Server",
+        "coreaudiod": "Core Audio",
+        "bluetoothd": "Bluetooth",
+        "locationd": "Location Services",
+        "mDNSResponder": "DNS and Bonjour",
+        "rapportd": "Continuity",
+        "sharingd": "AirDrop and Handoff",
+        "cfprefsd": "Preferences",
+        "trustd": "Certificate checks",
+        "syspolicyd": "Gatekeeper",
+        "XprotectService": "XProtect scan",
+        "tccd": "Privacy permissions",
+        "logd": "System logging",
+        "fseventsd": "File change events",
+        "dasd": "Background task scheduler",
+        "deleted": "Disk space cleanup",
+        "ReportCrash": "Crash reporter",
+        "spindump": "Hang reporter",
+    ]
+}
+
+enum ProcLookup {
+    // The fields that displayName needs.
+    static func identity(pid: Int32, name: String, path: String) -> ProcDetails {
+        var details = ProcDetails(name: name, path: path, argv: argv(of: pid), folder: folder(of: pid))
+        if let bundle = appBundle(in: path) {
+            details.app = appTitle(displayName: FileManager.default.displayName(atPath: bundle))
+            details.isAppExecutable = Bundle(path: bundle)?.executablePath == path
+        } else if let running = NSRunningApplication(processIdentifier: pid)?.localizedName {
+            details.app = running
+            details.isAppExecutable = true
+        }
+        return details
+    }
+
+    static func details(pid: Int32, name: String, path: String) -> ProcDetails {
+        var details = identity(pid: pid, name: name, path: path)
+        if appBundle(in: path) == nil { details.owner = owner(of: pid) }
+        details.parent = parentLabel(of: pid)
+        details.publisher = publisher(of: pid, path: path)
+        details.user = otherUser(of: pid)
+        if details.isSystemBinary { details.about = manSummary(name: name) }
+        return details
+    }
+
+    // Helpers can live in a nested .app; the outermost bundle is the app the
+    // user knows.
+    static func appBundle(in path: String) -> String? {
+        path.range(of: ".app/").map { String(path[..<$0.lowerBound]) + ".app" }
+    }
+
+    // The display name holds .app when the Finder shows all file extensions.
+    // deletingPathExtension would also cut "draw.io".
+    static func appTitle(displayName: String) -> String {
+        displayName.hasSuffix(".app") ? String(displayName.dropLast(4)) : displayName
+    }
+
+    static func kernelInfo(of pid: Int32) -> kinfo_proc? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info
+    }
+
+    static func parentPid(of pid: Int32) -> Int32? {
+        kernelInfo(of: pid)?.kp_eproc.e_ppid
+    }
+
+    // Fails for another user's process.
+    static func argv(of pid: Int32) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return [] }
+        return parseArguments(Array(buffer.prefix(size)))
+    }
+
+    // KERN_PROCARGS2 holds argc as an Int32, the executable path, NUL padding,
+    // argv, and then the environment.
+    static func parseArguments(_ buffer: [UInt8]) -> [String] {
+        guard buffer.count > 4 else { return [] }
+        let argc = buffer.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        var i = 4
+        while i < buffer.count, buffer[i] != 0 { i += 1 }
+        while i < buffer.count, buffer[i] == 0 { i += 1 }
+        var args: [String] = []
+        while i < buffer.count, args.count < Int(argc) {
+            let end = buffer[i...].firstIndex(of: 0) ?? buffer.count
+            args.append(String(decoding: buffer[i..<end], as: UTF8.self))
+            i = end + 1
+        }
+        return args
+    }
+
+    // Fails for another user's process.
+    static func folder(of pid: Int32) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        return path.isEmpty ? nil : path
+    }
+
+    // The process that macOS charges this one to: launchd is the parent of
+    // tmux and of XPC services, but this names kitty or the app that uses them.
+    // The function is not in the SDK headers. If a macOS release removes it,
+    // dlsym gives nil and owner(of:) uses the parent chain only.
+    private static let responsibleFunction: (@convention(c) (pid_t) -> pid_t)? = {
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        return dlsym(rtldDefault, "responsibility_get_pid_responsible_for_pid").map { unsafeBitCast($0, to: (@convention(c) (pid_t) -> pid_t).self) }
+    }()
+
+    private static func appName(of pid: Int32) -> String? {
+        if let bundle = AppDelegate.fullPath(of: pid).flatMap(appBundle(in:)) {
+            return appTitle(displayName: FileManager.default.displayName(atPath: bundle))
+        }
+        return NSRunningApplication(processIdentifier: pid)?.localizedName
+    }
+
+    private static func owner(of pid: Int32) -> String? {
+        if let responsible = responsibleFunction?(pid), responsible > 0, responsible != pid,
+           let name = appName(of: responsible) {
+            return name
+        }
+        var ancestor = parentPid(of: pid)
+        while let current = ancestor, current > 1 {
+            if let name = appName(of: current) { return name }
+            ancestor = parentPid(of: current)
+        }
+        return nil
+    }
+
+    private static func parentLabel(of pid: Int32) -> String? {
+        guard let parent = parentPid(of: pid), parent > 0 else { return nil }
+        // proc_pidpath fails when the executable was replaced after launch.
+        let path = AppDelegate.fullPath(of: parent)
+        let name = path.map { ($0 as NSString).lastPathComponent } ?? shortName(of: parent)
+        return "\(identity(pid: parent, name: name, path: path ?? "").displayName) [\(parent)]"
+    }
+
+    // The kernel's copy of the executable name, cut at 16 characters.
+    static func shortName(of pid: Int32) -> String {
+        guard var info = kernelInfo(of: pid) else { return "pid \(pid)" }
+        return withUnsafeBytes(of: &info.kp_proc.p_comm) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+    }
+
+    private static func otherUser(of pid: Int32) -> String? {
+        guard let uid = kernelInfo(of: pid)?.kp_eproc.e_ucred.cr_uid, uid != getuid(),
+              let entry = getpwuid(uid) else { return nil }
+        return String(cString: entry.pointee.pw_name)
+    }
+
+    private static func manSummary(name: String) -> String? {
+        for section in ["8", "1", "5"] {
+            guard let data = FileManager.default.contents(atPath: "/usr/share/man/man\(section)/\(name).\(section)") else { continue }
+            return ProcDetails.manSummary(roff: String(decoding: data, as: UTF8.self), name: name)
+        }
+        return nil
+    }
+
+    // The signature reads files and takes about 1 ms per process. It belongs
+    // to the binary, so one read per path is enough. Main thread only.
+    private static var publishers: [String: String?] = [:]
+
+    private static func publisher(of pid: Int32, path: String) -> String? {
+        if let known = publishers[path] { return known }
+        let publisher = signingCommonName(of: pid).map(ProcDetails.publisher(commonName:))
+        publishers[path] = publisher
+        return publisher
+    }
+
+    private static func signingCommonName(of pid: Int32) -> String? {
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess, let code else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dictionary = info as? [String: Any],
+              let certificates = dictionary[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              let leaf = certificates.first else { return nil }
+        var name: CFString?
+        SecCertificateCopyCommonName(leaf, &name)
+        return name as String?
+    }
 }
 
 // MARK: - Updates
@@ -350,7 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return ProcInfo.parse(out, fullPath: fullPath(of:))
     }
 
-    private static func fullPath(of pid: Int32) -> String? {
+    static func fullPath(of pid: Int32) -> String? {
         var buf = [CChar](repeating: 0, count: 4096)
         guard proc_pidpath(pid, &buf, 4096) > 0 else { return nil }
         return String(cString: buf)
@@ -359,11 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // Start time in microseconds since 1970. With the pid, it identifies a
     // process across pid reuse; sysctl reads it for every user's process.
     static func startTime(of pid: Int32) -> Int? {
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.size
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
-        let start = info.kp_proc.p_starttime
+        guard let start = ProcLookup.kernelInfo(of: pid)?.kp_proc.p_starttime else { return nil }
         return Int(start.tv_sec) * 1_000_000 + Int(start.tv_usec)
     }
 
@@ -405,18 +789,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             // No start time means the process exited after the sample.
             guard let start = Self.startTime(of: pid) else { continue }
             lastNotified[pid] = now
-            notify(pid: pid, start: start, name: info.name, since: since, now: now)
+            let shown = ProcLookup.identity(pid: pid, name: info.name, path: info.path).displayName
+            notify(pid: pid, start: start, name: info.name, shown: shown, since: since, now: now)
         }
     }
 
-    private func notify(pid: Int32, start: Int, name: String, since: Date, now: Date) {
+    // `shown` is for the text; the Mute button keys on `name`.
+    private func notify(pid: Int32, start: Int, name: String, shown: String, since: Date, now: Date) {
         let content = UNMutableNotificationContent()
         let mins = Int(now.timeIntervalSince(since) / 60)
-        content.title = "High CPU: \(name)"
-        content.body = "\(name) (pid \(pid)) has been above \(Int(Settings.alertThreshold))% of a core for \(mins) minutes."
+        content.title = "High CPU: \(shown)"
+        content.body = "\(shown) (pid \(pid)) has been above \(Int(Settings.alertThreshold))% of a core for \(mins) minutes."
         content.sound = .default
         content.categoryIdentifier = Note.category
-        content.userInfo = ["pid": Int(pid), "start": start, "name": name]
+        content.userInfo = ["pid": Int(pid), "start": start, "name": name, "shown": shown]
         let req = UNNotificationRequest(
             identifier: "hogwatch-\(pid)-\(Int(since.timeIntervalSince1970))",
             content: content,
@@ -585,13 +971,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let pid = Int32(info["pid"] as? Int ?? -1)
         let start = info["start"] as? Int
         let name = info["name"] as? String ?? ""
+        let shown = info["shown"] as? String ?? name
         let url = (info["url"] as? String).flatMap { URL(string: $0) }
         let action = response.actionIdentifier
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             switch action {
-            case Note.kill: self.killFromNotification(pid: pid, start: start, name: name, signal: SIGTERM)
-            case Note.forceKill: self.killFromNotification(pid: pid, start: start, name: name, signal: SIGKILL)
+            case Note.kill: self.killFromNotification(pid: pid, start: start, name: shown, signal: SIGTERM)
+            case Note.forceKill: self.killFromNotification(pid: pid, start: start, name: shown, signal: SIGKILL)
             case Note.mute:
                 if !name.isEmpty {
                     Settings.mute(name)
@@ -658,7 +1045,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(.separator())
 
         for entry in entries {
-            menu.addItem(rowItem(for: entry, minutes: minutes))
+            menu.addItem(rowItem(for: entry))
         }
 
         addFooter(to: menu)
@@ -677,7 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         view.threshold = Settings.alertThreshold
         view.series = zip(entries, Self.seriesColors).map { entry, color in
             GraphSeries(
-                name: entry.name,
+                name: entry.shown,
                 color: color,
                 points: window.map { (x: $0.date.timeIntervalSince(start) / span, y: $0.cpu[entry.pid] ?? 0) }
             )
@@ -723,12 +1110,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard let entry = item.representedObject as? TopEntry else { continue }
             if let info = procs[entry.pid] {
                 item.attributedTitle = Self.rowTitle(
-                    avg: entry.avg, name: entry.name, pid: entry.pid,
+                    avg: entry.avg, name: entry.shown, pid: entry.pid,
                     now: String(format: "%.0f%%", info.cpu), mem: Self.memoryText(kib: info.rss)
                 )
             } else {
                 item.attributedTitle = Self.rowTitle(
-                    avg: entry.avg, name: entry.name, pid: entry.pid, now: "exited", mem: ""
+                    avg: entry.avg, name: entry.shown, pid: entry.pid, now: "exited", mem: ""
                 )
                 item.isEnabled = false
             }
@@ -744,7 +1131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private struct TopEntry {
         let pid: Int32
         let start: Int?    // nil when the process exited before the menu opened
-        let name: String
+        let name: String   // executable name
+        let shown: String  // friendly name, for the row, the graph legend and the kill alert
+        let tooltip: String
         let path: String
         let avg: Double    // mean over the window, absent samples counting as 0
         let nowCpu: Double // latest sample
@@ -768,25 +1157,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             .sorted { $0.total > $1.total }
             .prefix(topCount)
-        // Start times only for the listed rows: one sysctl each.
+        // Start times and details only for the listed rows.
         return ranked.map { r in
-            TopEntry(pid: r.pid, start: Self.startTime(of: r.pid), name: r.info.name, path: r.info.path,
-                     avg: r.total / sampleCount, nowCpu: r.info.cpu, rss: r.info.rss)
+            let details = ProcLookup.details(pid: r.pid, name: r.info.name, path: r.info.path)
+            return TopEntry(pid: r.pid, start: Self.startTime(of: r.pid), name: r.info.name,
+                            shown: details.displayName, tooltip: details.tooltip, path: r.info.path,
+                            avg: r.total / sampleCount, nowCpu: r.info.cpu, rss: r.info.rss)
         }
     }
 
-    private func rowItem(for entry: TopEntry, minutes: Int) -> NSMenuItem {
+    private func rowItem(for entry: TopEntry) -> NSMenuItem {
         let now = String(format: "%.0f%%", entry.nowCpu)
         let mem = Self.memoryText(kib: entry.rss)
-        let item = NSMenuItem(title: "\(entry.name) [\(entry.pid)]", action: #selector(killTapped(_:)), keyEquivalent: "")
+        let item = NSMenuItem(title: "\(entry.shown) [\(entry.pid)]", action: #selector(killTapped(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = entry
-        item.attributedTitle = Self.rowTitle(avg: entry.avg, name: entry.name, pid: entry.pid, now: now, mem: mem)
+        item.attributedTitle = Self.rowTitle(avg: entry.avg, name: entry.shown, pid: entry.pid, now: now, mem: mem)
         item.image = Self.icon(pid: entry.pid, path: entry.path)
-        item.toolTip = String(
-            format: "%@ averaged %.1f%% of a core over the last %d min, %@ in the latest sample, with %@ resident memory. Click to kill it.",
-            entry.name, entry.avg, minutes, now, mem
-        )
+        // No CPU or memory here: the row refreshes those every second, and a
+        // tooltip keeps the text from when the menu opened.
+        item.toolTip = entry.tooltip + "\n\nClick to kill it."
         item.isEnabled = true
         return item
     }
@@ -824,7 +1214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         dim[.foregroundColor] = NSColor.secondaryLabelColor
 
         var shown = name
-        if shown.count > 24 { shown = String(shown.prefix(23)) + "…" }
+        if shown.count > 26 { shown = String(shown.prefix(25)) + "…" }
 
         let s = NSMutableAttributedString()
         s.append(NSAttributedString(string: String(format: "\t%.1f%%", avg), attributes: main))
@@ -845,10 +1235,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private static func icon(pid: Int32, path: String) -> NSImage {
         var img: NSImage?
-        if let r = path.range(of: ".app/") {
+        if let bundle = ProcLookup.appBundle(in: path) {
             // Helpers live inside the parent bundle (sometimes in a nested
             // .app); the outermost bundle's icon is the recognizable one.
-            img = NSWorkspace.shared.icon(forFile: String(path[..<r.lowerBound]) + ".app")
+            img = NSWorkspace.shared.icon(forFile: bundle)
         } else if let appIcon = NSRunningApplication(processIdentifier: pid)?.icon {
             img = appIcon
         } else if !path.isEmpty {
@@ -871,8 +1261,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
-        alert.messageText = "Kill \(target.name)?"
-        alert.informativeText = "pid \(target.pid) — Kill sends SIGTERM, Force Kill sends SIGKILL."
+        alert.messageText = "Kill \(target.shown)?"
+        alert.informativeText = "\(target.name), pid \(target.pid) — Kill sends SIGTERM, Force Kill sends SIGKILL."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Kill")
         alert.addButton(withTitle: "Force Kill")
@@ -887,7 +1277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
         if let reason = Self.sendSignal(pid: target.pid, start: target.start, sig) {
             let fail = NSAlert()
-            fail.messageText = "Could not kill \(target.name)"
+            fail.messageText = "Could not kill \(target.shown)"
             fail.informativeText = reason
             fail.alertStyle = .critical
             fail.addButton(withTitle: "OK")

@@ -13,6 +13,8 @@ Single Swift file, no dependencies, builds in seconds with the Xcode Command Lin
 - Samples `ps` every 30 seconds and keeps a sliding window (default 15 minutes).
 - The dropdown ranks the top 10 living processes by average CPU over that window, with app icons, pid, a now column, and a mem column. The now and mem columns refresh every second while the menu is open.
 - A graph at the top of the dropdown shows the CPU history of the top 3 processes over the window, with the alert threshold as a dashed line.
+- Rows show a friendly name where Hogwatch can find one: the app and helper role (`Google Chrome: Renderer`), the command (`claude` for the binary `2.1.318`), what a runtime runs (`node: start.mjs`, `Elixir: shop`), or a hand-written name for common macOS daemons (`Spotlight index` for `mds_stores`). The graph legend, the kill confirmation, and the notifications use the same name.
+- Hover a row to see the process name, a description, the application, the parent, the publisher, the user, the working folder, the command, and the path.
 - Click a row to kill the process (SIGTERM or SIGKILL, with confirmation).
 - When a process stays above a threshold (default 90% of one core) for a sustained period (default 30 minutes), you get a notification with Kill, Force Kill, and Mute buttons.
 - The menu bar icon turns orange as soon as anything crosses the icon threshold, before the notification fires. Hover it to see the culprit.
@@ -70,6 +72,10 @@ Everything lives under the Settings item in the dropdown. macOS keeps the Start 
 - The avg column counts samples where a process was absent as 0%, so it effectively ranks by total CPU consumed over the window.
 - The mem column is the resident set size (`ps` rss) in the latest sample. It counts shared framework pages and leaves out compressed memory, so it differs from the Memory column in Activity Monitor. Memory has no alerts and does not affect the ranking.
 - Tracking is per pid. Browser and Electron helpers appear as separate rows, and alerts target the one runaway helper rather than the whole app.
+- The Application line names the app that contains the executable. Otherwise it names the app that macOS holds responsible for the process, or the nearest parent that is an app. The responsible app comes from a function that is not in the macOS SDK; if a macOS release removes it, Hogwatch uses the parents only.
+- macOS shows the command and the working folder of your own processes only, so the tooltip of a root or system process leaves them out.
+- The description comes from the man page, for system binaries that have one. The daemon names are a hand-written table in `main.swift`, because macOS holds no friendly names for its daemons.
+- Muting keys on the executable name, not on the friendly name, so Muted alerts lists executable names.
 - The sustained-load clock only resets after 3 consecutive below-threshold samples, so a process oscillating around the threshold still triggers.
 - Sleep gaps reset sustained-load tracking; time asleep does not count toward the alert duration.
 - After notifying, the same pid is quiet for an hour before it can re-alert.
